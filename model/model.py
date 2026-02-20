@@ -1,5 +1,5 @@
 from transformers import PretrainedConfig
-
+import math
 
 class MokioMindConfig(PretrainedConfig):
     model_type = "mokiomind"
@@ -87,3 +87,61 @@ class RMSNorm(nn.Module):
     # 最后forward()
     def forward(self,x):
         return self.weight * self._norm(x.float()).type_as(x)
+
+# 首先写出rope算式
+def precomput_cis_freqs(dim:int,
+                        end:int=int(32*1024),
+                        rope_base:float=1e6,
+                        rope_scaling:Optional[dict]=None):
+    freqs = 1.0/rope_base**(torch.arrange(0,dim,2)[:dim//2].float()/dim)
+    if rope_scaling is not None:
+        orig_max, factor, beta_fast, beta_slow = (
+            rope_scaling.get("original_max_position_embeddings", 2048),
+            rope_scaling.get("factor", 4),
+            rope_scaling.get("beta_fast", 4.0),
+            rope_scaling.get("beta_slow", 1.0),
+        )
+        #计算corr_dim
+        corr_dim = next((i for i in range(dim//2) if 2*math.pi/freqs[i] >orig_max), dim//2)
+
+        # 计算power
+        power  = torch.arange(0,dim//2,device=freqs.device).float()/max(dim//2-1,1)
+
+        #计算beta
+        beta = beta_slow + (beta_fast-beta_slow)*power
+
+        #计算scale
+        scale = torch.where(
+            torch.arange(0,dim//2,device=freqs.device) < corr_dim,
+            (beta*factor-beta+1.0)/(beta*factor),
+            1/factor
+        )
+        # 应用scale
+        freqs = freqs*scale
+        # 生成位置索引,与频率相乘，得到完整的矩阵
+    t = torch.arange(end,device = freqs.device)
+    freqs = torch.outer(t,freqs).float()
+    # 计算cis
+    # freqs_cos = torch.cat([torch.cos(freqs),torch.cos(freqs)],dim=-1)
+    # freqs_sin = torch.cat([torch.sin(freqs),torch.sin(freqs)],dim=-1)
+    freqs_cos = torch.cos(freqs).repeat_interleave(2,dim=-1)
+    freqs_sin = torch.sin(freqs).repeat_interleave(2,dim=-1)
+    return freqs_cos, freqs_sin
+
+    def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim=1):
+        #维度对齐
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+    
+        def rotate_half(x):
+            # 取出偶数位：q0\q2\q4
+            x1 = x[...,::2]
+            # 取出奇数位：q1\q3\q5
+            x2 = x[...,1::2]
+            return torch.stack([-x2,x1],dim=-1).flatten(-2)
+        
+    #应用旋转位置编码
+    q_embed = q*cos + rotate_half(q)*sin
+    k_embed = k*cos + rotate_half(k)*sin
+    return q_embed, k_embed
+
