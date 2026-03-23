@@ -22,7 +22,7 @@ import torch.nn as nn
 # print(t.shape)
 # print(t.transpose(0,1),t.shape)
 
-t = torch.arange(1,13).view(3,4)
-print(t)
-t1= torch.triu(t,diagonal=1)
-print(t1)
+# t = torch.arange(1,25).view(4,6)
+# print(t)
+# t1= torch.tril(t,diagonal=-1)
+# print(t1)

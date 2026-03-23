@@ -1,8 +1,13 @@
 from transformers import PretrainedConfig
 import math
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+from typing import Optional, Tuple
+from transformers.activations import ACT2FN
 
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class MiniMindConfig(PretrainedConfig):
+    model_type = "minimind"
 
     def __init__(
         self,
@@ -128,20 +133,144 @@ def precomput_cis_freqs(dim:int,
     freqs_sin = torch.sin(freqs).repeat_interleave(2,dim=-1)
     return freqs_cos, freqs_sin
 
-    def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim=1):
-        #维度对齐
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
+def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim=1):
+    #维度对齐
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    def rotate_half(x):
+        # 取出偶数位：q0\q2\q4
+        x1 = x[...,::2]
+        # 取出奇数位：q1\q3\q5
+        x2 = x[...,1::2]
+        return torch.stack([-x2,x1],dim=-1).flatten(-2)
     
-        def rotate_half(x):
-            # 取出偶数位：q0\q2\q4
-            x1 = x[...,::2]
-            # 取出奇数位：q1\q3\q5
-            x2 = x[...,1::2]
-            return torch.stack([-x2,x1],dim=-1).flatten(-2)
-        
     #应用旋转位置编码
     q_embed = q*cos + rotate_half(q)*sin
     k_embed = k*cos + rotate_half(k)*sin
     return q_embed, k_embed
+
+def repeat_kv(x:torch.Tensor,n_rep:int)->torch.Tensor:
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return(
+        x[:,:,:,None,:]
+        .expand(bs,slen,num_key_value_heads,n_rep,head_dim)
+        .reshape(bs,slen,num_key_value_heads*n_rep, head_dim)
+    )
+
+    
+class Attention(nn.Module):
+    def __init__(self,args:MiniMindConfig):
+        super().__init__()
+        
+        self.num_key_value_heads = args.num_attention_heads\
+        if args.num_key_value_heads is None else args.num_key_value_heads
+
+        assert args.num_attention_heads % self.num_key_value_heads == 0,\
+        "num_attention_heads must be divisible by num_key_value_heads"
+
+        self.n_local_heads=args.num_attention_heads #Q
+        self.num_key_value_heads=args.num_key_value_heads
+        self.n_rep=self.n_local_heads // self.num_key_value_heads
+        self.head_dim=args.hidden_size//args.num_attention_heads
+
+        self.q_proj=nn.linear(args.hidden_size,args.num_attention_heads*self.head_dim,
+                              bias=False)
+        self.k_poj=nn.linear(args.hidden_size,self.num_key_value_heads*self.head_dim,
+                              bias=False)
+        self.v_proj=nn.linear(args.hidden_size,self.num_key_value_heads*self.head_dim,
+                              bias=False)
+        self.o_proj=nn.linear(args.num_attention_heads*self.head_dim,args.hidden_size,
+                              bias=False)
+        
+        self.attn_dropout=nn.Dropout(args.dropout)
+        self.resid_dropout=nn.Dropout(args.dropout)
+        self.dropout=args.dropout
+        self.flash=hasattr(torch.nn.functional,'scaled_dot_product_attention') and args.flash_attention
+
+    def forward(self,x:torch.Tensor,
+                position_embedding:tuple,
+                past_key_value:Tuple[torch.Tensor,torch.Tensor],
+                use_cache=False,
+                attn_mask:Optional[torch.Tensor]=None) -> torch.Tensor:
+        # 投影，计算qkv
+        bsz, seq_len, _ = x.shape
+        xq,xk,xv=self.q_proj(x),self.k_proj(x),self.v_proj(x)
+
+        # 把输入拆分成多个头，用view
+        xq = xq.view(bsz,seq_len,self.n_local_heads,self.head_dim)
+        xk = xk.view(bsz,seq_len,self.num_key_value_heads,self.head_dim)
+        xv = xv.view(bsz,seq_len,self.num_key_value_heads,self.head_dim)
+
+        #qk,使用rope
+        cos,sin = position_embedding
+        xq,xk = apply_rotary_pos_emb(xq,xk,cos[:seq_len],sin[:seq_len])
+         
+        # 对于kv，用repeat（注意kvcache）
+        if past_key_value is not None: #有kvcache
+            xk = torch.cat([past_key_value[0],xk],dim=1)
+            xv = torch.cat([past_key_value[1],xv],dim=1)
+        past_kv = (xk,xv)
+
+        xq,xk,xv=(
+            xq.transpose(1,2),
+            # [bsz,n_local,seq_len,head_dim]
+            repeat_kv(xk,self.n_rep).transpose(1,2),
+            repeat_kv(xv,self.n_rep).transpose(1,2)
+        )
+        # 进行attention计算，q@k^T/sqrt(d)
+        if self.flash and (seq_len>1) and (past_key_value is None) and (attn_mask is None or torch.all
+                                         (attn_mask==1)):
+            output=F.scaled_dot_product_attention(xq,xk,xv,dropout_p=self.dropout if self.training else 0.0, is_causal=True)
+        else:
+            scores=(xq@xk.transpose(-2,-1)/math.sqrt(self.head_dim))
+            scores[:,:,:,-seq_len:] += torch.triu(torch.full((seq_len,seq_len),float('-inf'),device=scores.device),diagonal=1)
+            if attn_mask is not None:
+                extended_attention_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+                extended_attention_mask = (1.0-extended_attention_mask)* -1e9 # 若输入序列中有0，那么将权重压缩
+                scores = scores + extended_attention_mask
+
+            scores = F.softmax(scores.float(),dim=-1).type_as(xq)
+            scores = self.attn_dropout(scores)
+            output = scores @ xv
+
+        # 最后拼接头
+        output = output.transpose(1,2).reshape(bsz,seq_len,-1)
+        output = self.resid_dropout(self.o_proj(output))
+        return output, past_kv
+    
+class FeedFward(nn.Module):
+    # initialize
+    def __init__(self,args:MiniMindConfig):
+        super().__init__()
+        if args.intermediate_size is None:
+            intermediate_size=int(args.hidden_size*8/3)
+            args.intermediate_size=64*(intermediate_size+64-1//64)
+
+        config = args.config
+        self.up_proj=nn.Linear(args.hidden_size,args.intermediate_size,bias=False)
+        self.down_proj=nn.Linear(args.intermediate_size,args.hidden_size,bias=False)
+        self.gate_proj=nn.Linear(args.hidden_size,args.intermediate_size,bisa=False)
+        self.dropout=nn.Dropout(args.dropout)
+        self.act_fn=ACT2FN[args.hidden_act]
+
+    def forward(self,x):
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x))*self.up_proj(x)))
+    
+
+
+
+
+
+
+
+        
+
+
+
+
+
+
 
