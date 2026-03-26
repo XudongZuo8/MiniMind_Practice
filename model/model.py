@@ -128,18 +128,18 @@ def precomput_cis_freqs(dim:int,
     freqs_sin = torch.sin(freqs).repeat_interleave(2,dim=-1)
     return freqs_cos, freqs_sin
 
-    def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim=1):
-        #维度对齐
-        cos = cos.unsqueeze(unsqueeze_dim)
-        sin = sin.unsqueeze(unsqueeze_dim)
+def apply_rotary_pos_emb(q,k,cos,sin,unsqueeze_dim=1):
+    #维度对齐
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
+    def rotate_half(x):
+        # 取出偶数位：q0\q2\q4
+        x1 = x[...,::2]
+        # 取出奇数位：q1\q3\q5
+        x2 = x[...,1::2]
+        return torch.stack([-x2,x1],dim=-1).flatten(-2)
     
-        def rotate_half(x):
-            # 取出偶数位：q0\q2\q4
-            x1 = x[...,::2]
-            # 取出奇数位：q1\q3\q5
-            x2 = x[...,1::2]
-            return torch.stack([-x2,x1],dim=-1).flatten(-2)
-        
     #应用旋转位置编码
     q_embed = q*cos + rotate_half(q)*sin
     k_embed = k*cos + rotate_half(k)*sin
